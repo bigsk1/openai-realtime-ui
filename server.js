@@ -1,5 +1,7 @@
 import express from "express";
 import fs from "fs";
+import dns from "node:dns/promises";
+import net from "node:net";
 import { createServer as createViteServer } from "vite";
 import "dotenv/config";
 
@@ -11,6 +13,142 @@ const searxngAuthEnabled = process.env.SEARXNG_AUTH_ENABLED === 'true';
 const searxngUser = process.env.SEARXNG_USER;
 const searxngPass = process.env.SEARXNG_PASS;
 const openaiModel = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
+const ALLOWED_PROXY_PROTOCOLS = new Set(["http:", "https:"]);
+const MAX_PROXY_REDIRECTS = 5;
+
+const blockedIpRanges = new net.BlockList();
+blockedIpRanges.addAddress("0.0.0.0", "ipv4");
+blockedIpRanges.addSubnet("10.0.0.0", 8, "ipv4");
+blockedIpRanges.addSubnet("127.0.0.0", 8, "ipv4");
+blockedIpRanges.addSubnet("169.254.0.0", 16, "ipv4");
+blockedIpRanges.addSubnet("172.16.0.0", 12, "ipv4");
+blockedIpRanges.addSubnet("192.168.0.0", 16, "ipv4");
+blockedIpRanges.addSubnet("100.64.0.0", 10, "ipv4");
+blockedIpRanges.addSubnet("198.18.0.0", 15, "ipv4");
+blockedIpRanges.addSubnet("224.0.0.0", 4, "ipv4");
+blockedIpRanges.addAddress("::", "ipv6");
+blockedIpRanges.addAddress("::1", "ipv6");
+blockedIpRanges.addSubnet("fc00::", 7, "ipv6");
+blockedIpRanges.addSubnet("fe80::", 10, "ipv6");
+
+const blockedHostnames = new Set([
+  "localhost",
+  "localhost.localdomain",
+  "metadata.google.internal",
+  "metadata",
+]);
+
+const normalizeHostname = (hostname) => hostname.toLowerCase().replace(/\.+$/, "");
+
+const isBlockedIpAddress = (address) => {
+  const family = net.isIP(address);
+  if (!family) return true;
+  return blockedIpRanges.check(address, family === 4 ? "ipv4" : "ipv6");
+};
+
+const parseProxyTargetUrl = (targetUrl, baseUrl) => {
+  let parsedUrl;
+  try {
+    parsedUrl = baseUrl ? new URL(targetUrl, baseUrl) : new URL(targetUrl);
+  } catch {
+    throw new Error("Invalid target URL");
+  }
+
+  if (!ALLOWED_PROXY_PROTOCOLS.has(parsedUrl.protocol)) {
+    throw new Error("Only http and https URLs are allowed");
+  }
+
+  if (!parsedUrl.hostname) {
+    throw new Error("Target URL hostname is required");
+  }
+
+  if (parsedUrl.username || parsedUrl.password) {
+    throw new Error("URL credentials are not allowed");
+  }
+
+  return parsedUrl;
+};
+
+const assertSafeProxyTarget = async (targetUrl) => {
+  const hostname = normalizeHostname(targetUrl.hostname);
+
+  if (!hostname) {
+    throw new Error("Target URL hostname is required");
+  }
+
+  if (blockedHostnames.has(hostname) || hostname.endsWith(".localhost")) {
+    throw new Error("Target host is blocked");
+  }
+
+  if (net.isIP(hostname)) {
+    if (isBlockedIpAddress(hostname)) {
+      throw new Error("Target IP address is blocked");
+    }
+    return;
+  }
+
+  let resolvedAddresses;
+  try {
+    resolvedAddresses = await dns.lookup(hostname, { all: true, verbatim: true });
+  } catch {
+    throw new Error("Could not resolve target host");
+  }
+
+  if (!resolvedAddresses.length) {
+    throw new Error("Could not resolve target host");
+  }
+
+  for (const { address } of resolvedAddresses) {
+    if (isBlockedIpAddress(address)) {
+      throw new Error("Target host resolves to a blocked IP address");
+    }
+  }
+};
+
+const fetchWithSafeRedirects = async (initialUrl, baseOptions) => {
+  let currentUrl = initialUrl;
+  let requestMethod = baseOptions.method;
+  let requestBody = baseOptions.body;
+
+  for (let redirectCount = 0; redirectCount <= MAX_PROXY_REDIRECTS; redirectCount += 1) {
+    await assertSafeProxyTarget(currentUrl);
+
+    const response = await fetch(currentUrl, {
+      ...baseOptions,
+      method: requestMethod,
+      body: requestBody,
+      redirect: "manual",
+    });
+
+    if (![301, 302, 303, 307, 308].includes(response.status)) {
+      return response;
+    }
+
+    const locationHeader = response.headers.get("location");
+    if (!locationHeader) {
+      return response;
+    }
+
+    if (redirectCount === MAX_PROXY_REDIRECTS) {
+      throw new Error("Too many redirects");
+    }
+
+    currentUrl = parseProxyTargetUrl(locationHeader, currentUrl);
+
+    // Align with common redirect semantics:
+    // - 303 always becomes GET
+    // - 301/302 switch POST to GET
+    if (
+      response.status === 303 ||
+      ((response.status === 301 || response.status === 302) && requestMethod === "POST")
+    ) {
+      requestMethod = "GET";
+      requestBody = undefined;
+    }
+  }
+
+  throw new Error("Too many redirects");
+};
 
 // Configure Vite middleware for React client with reduced logging
 const vite = await createViteServer({
@@ -241,12 +379,16 @@ app.all("/api/proxy", async (req, res) => {
     }
     
     // Append query parameters if this is a GET request and there are params
-    let fullUrl = targetUrl;
+    let fullUrl = String(targetUrl);
     if (req.method === 'GET' && Object.keys(req.query).length > 1) { // > 1 because 'url' is always there
       const params = new URLSearchParams();
       Object.entries(req.query).forEach(([key, value]) => {
         if (key !== 'url') { // Skip the 'url' parameter
-          params.append(key, value);
+          if (Array.isArray(value)) {
+            value.forEach((item) => params.append(key, item));
+          } else {
+            params.append(key, value);
+          }
         }
       });
       const queryString = params.toString();
@@ -254,9 +396,11 @@ app.all("/api/proxy", async (req, res) => {
         fullUrl += (fullUrl.includes('?') ? '&' : '?') + queryString;
       }
     }
-    
-    // Make the request to the target URL
-    const response = await fetch(fullUrl, options);
+
+    const parsedTargetUrl = parseProxyTargetUrl(fullUrl);
+
+    // Make the request to the target URL, validating each redirect hop.
+    const response = await fetchWithSafeRedirects(parsedTargetUrl, options);
     
     // Copy status code
     res.status(response.status);
@@ -288,7 +432,21 @@ app.all("/api/proxy", async (req, res) => {
     
   } catch (error) {
     console.error("Proxy request error:", error);
-    res.status(500).json({ 
+    const statusCode = [
+      "Invalid target URL",
+      "Only http and https URLs are allowed",
+      "Target URL hostname is required",
+      "URL credentials are not allowed",
+      "Target host is blocked",
+      "Target IP address is blocked",
+      "Could not resolve target host",
+      "Target host resolves to a blocked IP address",
+      "Too many redirects",
+    ].includes(error.message)
+      ? 400
+      : 500;
+
+    res.status(statusCode).json({
       error: `Proxy request failed: ${error.message}`,
       target_url: targetUrl
     });
